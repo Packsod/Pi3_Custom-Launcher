@@ -70,12 +70,9 @@ pip install -r requirements.txt
 With your Pi3 `venv` activated, apply the mod-specific additions:
 
 ```bat
-# 1. Install GeoCalib inference package
+# Install GeoCalib inference package
 mkdir weights\geocalib
 pip install git+[https://github.com/cvg/GeoCalib.git](https://github.com/cvg/GeoCalib.git)
-
-# 2. Pin Gradio version (required for launch compatibility)
-pip install --upgrade "gradio<6.0"
 
 ```
 
