@@ -1,9 +1,10 @@
-<img width="1349" height="751" alt="image" src="https://github.com/user-attachments/assets/b3e70a8b-4104-4936-93f5-31cf168135ef" />
-<img width="1383" height="823" alt="image" src="https://github.com/user-attachments/assets/7118f2ce-f27c-4b0b-bbf6-598afd79f2e8" />
+<img width="1389" height="761" alt="image" src="https://github.com/user-attachments/assets/84c252d8-d519-4109-a8ed-25658d719953" />
+<img width="1423" height="751" alt="image" src="https://github.com/user-attachments/assets/2bc316cb-1763-44bf-859c-051e094e6035" />
+
 
 # Pi3 Custom Launcher & Workbench
 
-An extensible custom launcher and local workbench for **[Pi3](https://github.com/yyfz/Pi3)** (by yyfz). 
+An extensible Gradio-based launcher and local workbench for **[Pi3](https://github.com/yyfz/Pi3)** (by yyfz). 
 
 This repository provides an optimized runner (`run_pi3_local.py`) and Windows entry point (`run_pi3_local.bat`). It is designed as a modular wrapper to integrate experimental features and pipeline enhancements onto Pi3 without modifying the upstream codebase directly.
 
