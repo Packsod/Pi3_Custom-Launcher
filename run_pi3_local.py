@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import gc, glob, json, os, shutil, sys, time, traceback
+import gc, glob, json, os, shutil, sys, time, traceback, uuid
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +39,13 @@ GEOCALIB_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT = REPO_ROOT / "outputs"
 WORK_ROOT = REPO_ROOT / "_gradio_work"
 
-# 设置 PyTorch Hub 缓存目录，避免动态 Patching
+# 缓存与会话管理策略
+MAX_SESSIONS = 3                        # 最多保留活跃会话数
+MAX_IMAGES_RAM_BYTES = 2_000_000_000    # 图像 CPU RAM 限制 ~2GB
+MAX_PREDICTIONS_RAM_BYTES = 1_000_000_000 # 预测结果 CPU RAM 限制 ~1GB
+KEEP_IMAGE_DISK_CACHE = False           # 淘汰会话时是否保留磁盘图像
+
+# 设置 PyTorch Hub 缓存目录
 os.environ["TORCH_HOME"] = str(GEOCALIB_MODELS_DIR)
 
 DEFAULT_INTERVAL = None
@@ -61,10 +68,127 @@ QUEUE_MAX_SIZE = 2
 
 
 # =============================================================================
+# Session Manager (RAM 优先 + 动态回收)
+# =============================================================================
+class SessionManager:
+    def __init__(self, work_root: Path):
+        self.work_root = work_root
+        self.sessions: OrderedDict[str, dict] = OrderedDict()
+
+    def create_session(self, image_files: list[str], session_dir: Path) -> str:
+        self._evict_if_needed()
+
+        session_id = uuid.uuid4().hex
+        final_dir = self.work_root / session_id
+        
+        # 将临时生成的图片目录更名为 session_id 目录
+        if session_dir.exists():
+            if final_dir.exists():
+                shutil.rmtree(final_dir, ignore_errors=True)
+            session_dir.rename(final_dir)
+            
+        images_dir = final_dir / "images"
+        rel_image_paths = sorted([str(p) for p in images_dir.glob("*") if p.is_file()])
+
+        session: dict = {
+            "session_id": session_id,
+            "imgs_cpu": None,          # 按需加载 [N,3,H,W] Tensor
+            "imgs_dir": images_dir,
+            "predictions": None,       # dict 缓存在 RAM
+            "predictions_path": None,  # .npz 路径
+            "gallery_paths": rel_image_paths,
+            "last_export_dir": None,
+            "last_used": time.time(),
+        }
+
+        self.sessions[session_id] = session
+        self.sessions.move_to_end(session_id)
+        return session_id
+
+    def get_session(self, session_id: str) -> dict:
+        if not session_id or session_id not in self.sessions:
+            raise KeyError("Session not found or expired.")
+        self.sessions.move_to_end(session_id)
+        self.sessions[session_id]["last_used"] = time.time()
+        return self.sessions[session_id]
+
+    def load_images_to_ram(self, session_id: str) -> torch.Tensor:
+        sess = self.get_session(session_id)
+        if sess["imgs_cpu"] is not None:
+            return sess["imgs_cpu"]
+
+        imgs = load_images_as_tensor(str(sess["imgs_dir"]), interval=1) # 加载至 CPU
+        sess["imgs_cpu"] = imgs
+        self._evict_if_needed()
+        return imgs
+
+    def set_predictions(self, session_id: str, predictions: dict, predictions_path: Path | None = None):
+        sess = self.get_session(session_id)
+        sess["predictions"] = predictions
+        sess["predictions_path"] = predictions_path
+        self._evict_if_needed()
+
+    def get_predictions(self, session_id: str) -> dict | None:
+        sess = self.get_session(session_id)
+        if sess["predictions"] is not None:
+            return sess["predictions"]
+        path = sess["predictions_path"]
+        if path is not None and path.exists():
+            loaded = np.load(path)
+            return {k: np.asarray(loaded[k]) for k in ["images", "points", "conf", "camera_poses"]}
+        return None
+
+    def destroy_session(self, session_id: str):
+        if session_id not in self.sessions:
+            return
+        sess = self.sessions.pop(session_id)
+
+        sess["imgs_cpu"] = None
+        sess["predictions"] = None
+
+        if sess["imgs_dir"] is not None and sess["imgs_dir"].exists():
+            if KEEP_IMAGE_DISK_CACHE:
+                if sess["predictions_path"] and sess["predictions_path"].exists():
+                    sess["predictions_path"].unlink(missing_ok=True)
+            else:
+                shutil.rmtree(sess["imgs_dir"].parent, ignore_errors=True)
+
+    def _evict_if_needed(self):
+        # 1) 按数量配额淘汰
+        while len(self.sessions) > MAX_SESSIONS:
+            oldest_id = next(iter(self.sessions))
+            self.destroy_session(oldest_id)
+
+        # 2) 按 CPU RAM 使用上限淘汰
+        def img_bytes(s: dict) -> int:
+            t = s.get("imgs_cpu")
+            return t.element_size() * t.nelement() if isinstance(t, torch.Tensor) else 0
+
+        def pred_bytes(s: dict) -> int:
+            p = s.get("predictions")
+            if not isinstance(p, dict): return 0
+            tot = 0
+            for v in p.values():
+                if isinstance(v, torch.Tensor): tot += v.element_size() * v.nelement()
+                elif isinstance(v, np.ndarray): tot += v.itemsize * v.size
+            return tot
+
+        while sum(img_bytes(s) for s in self.sessions.values()) > MAX_IMAGES_RAM_BYTES and len(self.sessions) > 1:
+            oldest_id = next(iter(self.sessions))
+            self.sessions[oldest_id]["imgs_cpu"] = None
+
+        while sum(pred_bytes(s) for s in self.sessions.values()) > MAX_PREDICTIONS_RAM_BYTES and len(self.sessions) > 1:
+            oldest_id = next(iter(self.sessions))
+            self.sessions[oldest_id]["predictions"] = None
+
+
+SESSION_MANAGER = SessionManager(WORK_ROOT)
+
+
+# =============================================================================
 # Helper functions
 # =============================================================================
 def get_geocalib_model(weights="pinhole", device="cuda"):
-    """获取 GeoCalib 模型（利用 TORCH_HOME，无需动态修补）"""
     if not GEOCALIB_AVAILABLE:
         return None
     if weights not in _GEOCALIB_MODELS:
@@ -73,7 +197,6 @@ def get_geocalib_model(weights="pinhole", device="cuda"):
     return _GEOCALIB_MODELS[weights].to(device).eval()
 
 def unload_geocalib_from_cuda(delete_model: bool = False) -> None:
-    """彻底将 GeoCalib 权重从 GPU 中移出并清理显存"""
     global _GEOCALIB_MODELS
     for weights, geo_model in list(_GEOCALIB_MODELS.items()):
         try:
@@ -88,13 +211,9 @@ def unload_geocalib_from_cuda(delete_model: bool = False) -> None:
     cleanup_memory()
 
 def rotation_align_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
-    """返回 4x4 旋转矩阵，使 source 向量旋转对齐到 target 向量"""
     source = source / max(np.linalg.norm(source), 1e-12)
     target = target / max(np.linalg.norm(target), 1e-12)
-
-    # 求解把 source 旋转到 target 的旋转矩阵
     R_mat, _ = Rotation.align_vectors(target[None, :], source[None, :])
-    
     T = np.eye(4, dtype=np.float32)
     T[:3, :3] = R_mat.as_matrix().astype(np.float32)
     return T
@@ -285,7 +404,6 @@ def export_pointcloud_ply(predictions: dict, export_dir: Path, conf_thres: float
     if len(vertices) == 0:
         raise RuntimeError("No point remains after confidence filtering. Lower Confidence Threshold.")
 
-    # X 轴旋转 +90 度校正
     R_x90 = Rotation.from_euler("x", 90, degrees=True).as_matrix().astype(np.float32)
     vertices = vertices @ R_x90.T
 
@@ -347,7 +465,6 @@ def export_camera_poses(predictions: dict, export_dir: Path, original_image_size
         img_h, img_w = (imgs.shape[2:4] if imgs.ndim == 4 and imgs.shape[1] == 3 else imgs.shape[1:3])
         resolutions = np.broadcast_to([img_w, img_h], (num_cameras, 2)).astype(np.int32)
 
-    # 相机位姿 X 轴 +90 度校正
     T_x90 = np.eye(4, dtype=np.float32)
     T_x90[:3, :3] = Rotation.from_euler("x", 90, degrees=True).as_matrix().astype(np.float32)
     poses = transform_camera_poses(poses, T_x90)
@@ -405,27 +522,18 @@ def export_per_view_geometry_if_enabled(predictions: dict, export_dir: Path) -> 
 # =============================================================================
 # Optimized Execution Function
 # =============================================================================
-def run_model(target_dir: str, model: Pi3X) -> dict:
+def run_model(session_id: str, model: Pi3X) -> dict:
     device = require_cuda()
-
-    # 1. 确保在 Pi3X 计算前卸载 GeoCalib
     unload_geocalib_from_cuda(delete_model=False)
-
     model = model.to(device).eval()
 
-    image_dir = os.path.join(target_dir, "images")
-    if not glob.glob(os.path.join(image_dir, "*")):
-        raise ValueError("No images found. Check the uploaded input.")
-
-    imgs = load_images_as_tensor(image_dir, interval=1).to(device)
+    # 从 RAM 或磁盘加载 Tensor 格式图像
+    imgs = SESSION_MANAGER.load_images_to_ram(session_id).to(device)
 
     num_frames = len(imgs)
     sample_indices = np.unique(np.linspace(0, num_frames - 1, min(9, num_frames), dtype=int))
-
-    # 将 GeoCalib 采样帧移至 CPU 暂存
     geocalib_frames_cpu = {int(i): imgs[int(i)].detach().cpu() for i in sample_indices}
 
-    # 2. 模型前向推理
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=get_autocast_dtype()):
         predictions = model(imgs[None], with_prior=False)
 
@@ -435,7 +543,6 @@ def run_model(target_dir: str, model: Pi3X) -> dict:
     poses_gpu = predictions["camera_poses"]
     conf_gpu = predictions["conf"]
 
-    # 3. 转换至 CPU NumPy 斩断 GPU 引用
     output = {
         "images": imgs[None].permute(0, 1, 3, 4, 2).detach().float().cpu().numpy().squeeze(0),
         "points": pts_gpu.detach().float().cpu().numpy().squeeze(0),
@@ -443,11 +550,10 @@ def run_model(target_dir: str, model: Pi3X) -> dict:
         "camera_poses": poses_gpu.detach().float().cpu().numpy().squeeze(0),
     }
 
-    # 4. 清理 GPU 资源
     del predictions, pts_gpu, poses_gpu, conf_gpu, imgs
     cleanup_memory()
 
-    # GeoCalib 校准
+    # GeoCalib Gravity Alignment
     if GEOCALIB_AVAILABLE and len(geocalib_frames_cpu) > 0:
         try:
             geo_model = get_geocalib_model(weights="pinhole", device=device)
@@ -465,7 +571,6 @@ def run_model(target_dir: str, model: Pi3X) -> dict:
                     del frame_tensor
                     continue
 
-                # 从 GeoCalib 结果提取重力向量
                 g_tensor = getattr(gravity_obj, "vec3d", getattr(gravity_obj, "vec", gravity_obj))
                 if hasattr(gravity_obj, "R"):
                     R_g = gravity_obj.R
@@ -492,7 +597,6 @@ def run_model(target_dir: str, model: Pi3X) -> dict:
             gravity_world, _, _ = robust_mean_unit_vectors(g_worlds, max_angle_deg=20.0)
 
             if gravity_world is not None:  
-                # 明确将重力向量对齐到真实的向下方向 [0, -1, 0]
                 target_down_world = np.array([0.0, -1.0, 0.0], dtype=np.float32)
                 align_mat = rotation_align_vectors(gravity_world, target_down_world)
 
@@ -513,20 +617,32 @@ def run_model(target_dir: str, model: Pi3X) -> dict:
             del geocalib_frames_cpu
             cleanup_memory()
 
+    # 将预测数据存回 RAM 及缓存
+    sess = SESSION_MANAGER.get_session(session_id)
+    pred_path = sess["imgs_dir"].parent / "predictions_preview.npz"
+    np.savez_compressed(
+        pred_path,
+        images=output["images"],
+        points=output["points"],
+        conf=output["conf"],
+        camera_poses=output["camera_poses"],
+    )
+    SESSION_MANAGER.set_predictions(session_id, output, pred_path)
+
     return output
 
 
 # =============================================================================
-# Upload / video sampling
+# Upload / Session Prep
 # =============================================================================
 def handle_uploads(input_video, input_images, interval=-1):
     cleanup_memory()
     ensure_directories()
 
-    target_dir = WORK_ROOT / f"input_images_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    target_dir_images = target_dir / "images"
-    shutil.rmtree(target_dir, ignore_errors=True)
-    target_dir_images.mkdir(parents=True, exist_ok=True)
+    temp_dir = WORK_ROOT / f"tmp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    temp_images_dir = temp_dir / "images"
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_images_dir.mkdir(parents=True, exist_ok=True)
 
     image_paths = []
     try:
@@ -540,9 +656,9 @@ def handle_uploads(input_video, input_images, interval=-1):
             src = file_data.get("name", file_data) if isinstance(file_data, dict) else str(file_data)
             if not os.path.isfile(src): continue
 
-            dst = target_dir_images / os.path.basename(src)
+            dst = temp_images_dir / os.path.basename(src)
             if dst.exists():
-                dst = target_dir_images / f"{len(image_paths):06d}{Path(src).suffix}"
+                dst = temp_images_dir / f"{len(image_paths):06d}{Path(src).suffix}"
 
             shutil.copy(src, dst)
             image_paths.append(str(dst))
@@ -563,7 +679,7 @@ def handle_uploads(input_video, input_images, interval=-1):
                 if not gotit: break
                 count += 1
                 if count % frame_interval == 0:
-                    img_path = target_dir_images / f"{video_frame_num:06d}.png"
+                    img_path = temp_images_dir / f"{video_frame_num:06d}.png"
                     if not cv2.imwrite(str(img_path), frame):
                         raise RuntimeError(f"Failed to write frame: {img_path}")
                     image_paths.append(str(img_path))
@@ -571,58 +687,45 @@ def handle_uploads(input_video, input_images, interval=-1):
         finally:
             vs.release()
 
-    image_paths = sorted(image_paths)
     if not image_paths:
-        shutil.rmtree(target_dir, ignore_errors=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
         raise ValueError("No valid images or video frames were prepared.")
 
-    return str(target_dir), image_paths
+    session_id = SESSION_MANAGER.create_session(image_paths, temp_dir)
+    sess = SESSION_MANAGER.get_session(session_id)
+    return session_id, sess["gallery_paths"]
 
 def update_gallery_on_upload(input_video, input_images, interval=-1):
     if not input_video and not input_images:
         return None, "None", None, "", gr.Dropdown(choices=["All"], value="All")
 
     try:
-        target_dir, image_paths = handle_uploads(input_video, input_images, interval=interval)
-        return None, target_dir, image_paths, f"Prepared {len(image_paths)} images. Click Reconstruct.", gr.Dropdown(choices=["All"], value="All")
+        session_id, gallery_paths = handle_uploads(input_video, input_images, interval=interval)
+        return None, session_id, gallery_paths, f"Prepared {len(gallery_paths)} images. Click Reconstruct.", gr.Dropdown(choices=["All"], value="All")
     except Exception as error:
         return None, "None", None, f"Error: `{error}`", gr.Dropdown(choices=["All"], value="All")
 
 
 # =============================================================================
-# Reconstruction / preview
+# Reconstruction / Preview Management
 # =============================================================================
-def build_glb_path(target_dir: str, conf_thres: float, frame_filter: str, show_cam: bool) -> str:
+def build_glb_path(session_id: str, conf_thres: float, frame_filter: str, show_cam: bool) -> str:
+    sess = SESSION_MANAGER.get_session(session_id)
     safe_filter = safe_filename(str(frame_filter), fallback="All")
-    return os.path.join(target_dir, f"preview_{float(conf_thres):.2f}_{safe_filter}_cam{bool(show_cam)}.glb")
+    return str(sess["imgs_dir"].parent / f"preview_{float(conf_thres):.2f}_{safe_filter}_cam{bool(show_cam)}.glb")
 
-def save_preview_predictions(target_dir: str, predictions: dict) -> None:
-    np.savez_compressed(
-        os.path.join(target_dir, "predictions_preview.npz"),
-        images=np.asarray(predictions["images"]),
-        points=np.asarray(predictions["points"]),
-        conf=np.asarray(predictions["conf"]),
-        camera_poses=np.asarray(predictions["camera_poses"]),
-    )
-
-def load_preview_predictions(target_dir: str) -> dict:
-    path = os.path.join(target_dir, "predictions_preview.npz")
-    if not os.path.exists(path):
-        raise FileNotFoundError("No cached reconstruction. Click Reconstruct first.")
-    loaded = np.load(path)
-    return {k: np.asarray(loaded[k]) for k in ["images", "points", "conf", "camera_poses"]}
-
-def gradio_demo(target_dir, conf_thres=DEFAULT_CONFIDENCE_PERCENT, frame_filter="All", show_cam=True):
-    if not os.path.isdir(target_dir) or target_dir == "None":
+def gradio_demo(session_id, conf_thres=DEFAULT_CONFIDENCE_PERCENT, frame_filter="All", show_cam=True):
+    if not session_id or session_id == "None":
         return None, "Error: no valid uploaded input.", gr.Dropdown(choices=["All"], value="All"), "None"
 
     start_time = time.time()
     cleanup_memory()
 
     try:
-        predictions = run_model(target_dir, model)
+        predictions = run_model(session_id, model)
 
-        all_files = sorted(os.listdir(os.path.join(target_dir, "images")))
+        sess = SESSION_MANAGER.get_session(session_id)
+        all_files = sorted(os.listdir(str(sess["imgs_dir"])))
         frame_filter_choices = [f"{i}: {f}" for i, f in enumerate(all_files)]
 
         idx = parse_frame_index(frame_filter)
@@ -632,19 +735,18 @@ def gradio_demo(target_dir, conf_thres=DEFAULT_CONFIDENCE_PERCENT, frame_filter=
         if predictions is None:
             raise RuntimeError("run_model() 返回了 None，请检查模型推理逻辑！")
             
-        save_preview_predictions(target_dir, predictions)
         export_dir = create_export_dir()
+        sess["last_export_dir"] = export_dir
 
         _, point_count = export_pointcloud_ply(predictions, export_dir, conf_thres)
         export_camera_poses(predictions, export_dir)
         export_per_view_geometry_if_enabled(predictions, export_dir)
 
-        glbfile = build_glb_path(target_dir, conf_thres, frame_filter, show_cam)
+        glbfile = build_glb_path(session_id, conf_thres, frame_filter, show_cam)
         glbscene = predictions_to_glb(predictions, conf_thres=conf_thres, filter_by_frames=frame_filter, show_cam=show_cam)
         glbscene.export(file_obj=glbfile)
 
         elapsed = time.time() - start_time
-        del predictions
         cleanup_memory()
 
         return (
@@ -660,13 +762,16 @@ def gradio_demo(target_dir, conf_thres=DEFAULT_CONFIDENCE_PERCENT, frame_filter=
         print("="*50)
         return None, f"Error: `{error}`", gr.Dropdown(choices=["All"], value="All"), "None"
 
-def update_visualization(target_dir, conf_thres, frame_filter, show_cam):
-    if not target_dir or target_dir == "None" or not os.path.isdir(target_dir):
+def update_visualization(session_id, conf_thres, frame_filter, show_cam):
+    if not session_id or session_id == "None":
         return None, "No reconstruction cache."
 
     try:
-        predictions = load_preview_predictions(target_dir)
-        glbfile = build_glb_path(target_dir, conf_thres, frame_filter, show_cam)
+        predictions = SESSION_MANAGER.get_predictions(session_id)
+        if predictions is None:
+            return None, "No reconstruction cache."
+
+        glbfile = build_glb_path(session_id, conf_thres, frame_filter, show_cam)
 
         if not os.path.exists(glbfile):
             glbscene = predictions_to_glb(predictions, conf_thres=conf_thres, filter_by_frames=frame_filter, show_cam=show_cam)
@@ -676,12 +781,14 @@ def update_visualization(target_dir, conf_thres, frame_filter, show_cam):
     except Exception as error:
         return None, f"Error: `{error}`"
 
-def clear_fields():
+def clear_fields(session_id):
+    if session_id and session_id != "None":
+        SESSION_MANAGER.destroy_session(session_id)
     return None, "None", "None", None, "", None, None, DEFAULT_INTERVAL, DEFAULT_CONFIDENCE_PERCENT, gr.Dropdown(choices=["All"], value="All"), True
 
 
 # =============================================================================
-# UI
+# UI Build
 # =============================================================================
 def build_ui():
     css_style = """
@@ -702,7 +809,7 @@ def build_ui():
     """
 
     with gr.Blocks() as demo:
-        target_dir_output = gr.Textbox(label="Target Dir", visible=False, value="None")
+        session_id_output = gr.Textbox(label="Session ID", visible=False, value="None")
         export_dir_output = gr.Textbox(label="Export Dir", visible=False, value="None")
 
         gr.HTML(css_style + '<div class="intro-content"><h1>🌌 π³ Local Point Cloud Export</h1><p class="subtitle">PLY point cloud and Blender camera export.</p></div>')
@@ -734,7 +841,7 @@ def build_ui():
                     frame_filter = gr.Dropdown(choices=["All"], value="All", label="Show Points from Frame")
 
         upload_inputs = [input_video, input_images, interval]
-        upload_outputs = [reconstruction_output, target_dir_output, image_gallery, log_output, frame_filter]
+        upload_outputs = [reconstruction_output, session_id_output, image_gallery, log_output, frame_filter]
         
         for comp in upload_inputs:
             comp.change(fn=update_gallery_on_upload, inputs=upload_inputs, outputs=upload_outputs)
@@ -743,20 +850,20 @@ def build_ui():
             fn=lambda: "Reconstructing...", outputs=[log_output]
         ).then(
             fn=gradio_demo,
-            inputs=[target_dir_output, conf_thres, frame_filter, show_cam],
+            inputs=[session_id_output, conf_thres, frame_filter, show_cam],
             outputs=[reconstruction_output, log_output, frame_filter, export_dir_output],
         )
 
-        vis_inputs = [target_dir_output, conf_thres, frame_filter, show_cam]
+        vis_inputs = [session_id_output, conf_thres, frame_filter, show_cam]
         vis_outputs = [reconstruction_output, log_output]
         
-        # 批量绑定可视化参数的 change 事件
         for comp in [conf_thres, frame_filter, show_cam]:
             comp.change(fn=update_visualization, inputs=vis_inputs, outputs=vis_outputs)
 
         clear_btn.click(
             fn=clear_fields,
-            outputs=[reconstruction_output, target_dir_output, export_dir_output, image_gallery, log_output, input_video, input_images, interval, conf_thres, frame_filter, show_cam],
+            inputs=[session_id_output],
+            outputs=[reconstruction_output, session_id_output, export_dir_output, image_gallery, log_output, input_video, input_images, interval, conf_thres, frame_filter, show_cam],
         )
 
     return demo
