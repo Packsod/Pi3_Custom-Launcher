@@ -8,7 +8,8 @@ Designed as a modular extension, this repository supercharges upstream Pi3 with 
 <img width="1389" height="761" alt="image" src="https://github.com/user-attachments/assets/84c252d8-d519-4109-a8ed-25658d719953" />
 <img width="1423" height="751" alt="image" src="https://github.com/user-attachments/assets/2bc316cb-1763-44bf-859c-051e094e6035" />
 <img width="912" height="681" alt="image" src="https://github.com/user-attachments/assets/9c8b3f74-ae89-479f-9cb7-520423c53fc1" />
-<img width="1201" height="755" alt="image" src="https://github.com/user-attachments/assets/3e89f2c1-2915-435d-af50-658fbc8c9b5e" />
+<img width="1184" height="747" alt="image" src="https://github.com/user-attachments/assets/9ba4788a-4e53-460a-8914-39a60808c08c" />
+
 
 > **Preview Overview**: Figures 1 & 3 show the Gradio interactive workbench; Figures 2 & 4 show point clouds and camera setups imported directly into Blender (rendered via *Point Cloud Visualizer* add-on). Note that while GeoCalib auto-aligns the scene to world vertical direction, residual alignment errors are unavoidable depending on visual cues.
 
