@@ -33,10 +33,10 @@ Place all files directly into your local **Pi3 project root**:
 <Your_Pi3_Project_Root>/
 ├── venv/                       # Virtual environment (Default: "venv")
 ├── pi3/                        # Upstream Pi3 codebase
-├── weights/
+├── weights/                    # run_pi3_local.bat automatically generates this directory and subdirectories.
 │   ├── geocalib/               # Auto-downloaded GeoCalib weights
-│   ├── Pi3/                    # Base Pi3 weights
-│   └── Pi3X/                   # Base Pi3X weights
+│   ├── Pi3/                    # Base Pi3 weights, I don't use it.
+│   └── Pi3X/                   # Base Pi3X weights, put model.safetensors into it
 ├── _gradio_work/               # Auto-managed session cache (Auto-cleaned)
 ├── outputs/                    # Final exported PLY & camera pose files
 ├── run_pi3_local.py            # [Mod] Custom Launcher & Workbench UI
@@ -52,7 +52,7 @@ Place all files directly into your local **Pi3 project root**:
 
 ### Step 1: Upstream Pi3 Base Environment
 
-Follow the official [Pi3 Repository](https://github.com/yyfz/Pi3) to complete the base installation:
+Specify a path, follow the official [Pi3 Repository](https://github.com/yyfz/Pi3) to complete the base installation:
 
 ```bat
 git clone [https://github.com/yyfz/Pi3.git](https://github.com/yyfz/Pi3.git)
@@ -67,11 +67,12 @@ pip install -r requirements.txt
 
 ### Step 2: Mod Additions
 
-With your `venv` active, install the GeoCalib package:
+With your `venv` active, install the GeoCalib package 
+(it automatically installs very few dependencies):
 
 ```bat
-mkdir weights\geocalib
-pip install git+[https://github.com/cvg/GeoCalib.git](https://github.com/cvg/GeoCalib.git)
+call venv\Scripts\activate
+pip install git+https://github.com/cvg/GeoCalib.git
 
 ```
 
