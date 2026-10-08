@@ -19,6 +19,7 @@ import torch
 import trimesh
 from safetensors.torch import load_file
 from scipy.spatial.transform import Rotation
+from scipy.optimize import least_squares
 
 from pi3.models.pi3x import Pi3X
 from pi3.utils.basic import load_images_as_tensor
@@ -142,6 +143,7 @@ class SessionManager:
         sess["predictions_path"] = predictions_path
         self._evict_if_needed(protected_id=session_id)
 
+    # 修改 SessionManager.get_predictions 方法
     def get_predictions(self, session_id: str) -> dict | None:
         sess = self.get_session(session_id)
         if sess["predictions"] is not None:
@@ -150,9 +152,13 @@ class SessionManager:
         path = sess["predictions_path"]
         if path is not None and path.exists():
             with np.load(path) as loaded:
+                if "local_points" not in loaded:
+                    raise KeyError(f"Selected NPZ cache '{path}' lacks 'local_points'. Please rerun reconstruction.")
+                
                 predictions = {
                     "images": np.asarray(loaded["images"]),
                     "points": np.asarray(loaded["points"]),
+                    "local_points": np.asarray(loaded["local_points"]),
                     "conf": np.asarray(loaded["conf"]),
                     "camera_poses": np.asarray(loaded["camera_poses"]),
                     "focals": np.asarray(loaded["focals"]) if "focals" in loaded else None,
@@ -360,6 +366,328 @@ def apply_gravity_alignment(points: np.ndarray, camera_poses: np.ndarray, gravit
     return transform_world_points(points, T_align), transform_camera_poses(camera_poses, T_align)
 
 
+# =============================================================================
+# new functions for fov
+# =============================================================================
+
+# =============================================================================
+# 1. 坐标轴与 Convention 自动验证 (Diagnostics & Sanity Check)
+# =============================================================================
+def verify_local_points_convention(local_points: np.ndarray) -> bool:
+    """
+    数值验证 Pi3X local_points 是否符合 OpenCV 坐标系 (+X Right, +Y Down, +Z Forward)
+    """
+    P = np.asarray(local_points, dtype=np.float64)
+    H, W, _ = P.shape
+
+    center = P[H // 2, W // 2]
+    left   = P[H // 2, W // 4]
+    right  = P[H // 2, 3 * W // 4]
+    top    = P[H // 4, W // 2]
+    bottom = P[3 * H // 4, W // 2]
+
+    # 检查基本空间方向关系
+    valid_z = np.nanmedian(P[..., 2]) > 0
+    valid_x = right[0] > left[0]
+    valid_y = bottom[1] > top[1]
+
+    if not (valid_z and valid_x and valid_y):
+        print(f"⚠️ [Pi3X Convention Warning] Local point map axes deviate from OpenCV convention!")
+        print(f"   Median Z > 0: {valid_z}, Right.x > Left.x: {valid_x}, Bottom.y > Top.y: {valid_y}")
+        return False
+    return True
+
+
+# =============================================================================
+# 2. 空间均匀网格分层采样 (Stratified Grid Sampling)
+# =============================================================================
+def stratified_sampling_indices(
+    valid_mask: np.ndarray, 
+    conf: np.ndarray | None, 
+    grid_rows: int = 16, 
+    grid_cols: int = 16, 
+    per_cell: int = 128
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    将图像划分网格，在每个网格内按 Confidence 降序采样，防止地层/大墙面过度占据回归权重
+    """
+    H, W = valid_mask.shape
+    selected_y, selected_x = [], []
+
+    for gy in range(grid_rows):
+        y0 = gy * H // grid_rows
+        y1 = (gy + 1) * H // grid_rows
+        for gx in range(grid_cols):
+            x0 = gx * W // grid_cols
+            x1 = (gx + 1) * W // grid_cols
+
+            cell_valid = valid_mask[y0:y1, x0:x1]
+            ys, xs = np.where(cell_valid)
+            if len(xs) == 0:
+                continue
+
+            abs_ys = ys + y0
+            abs_xs = xs + x0
+
+            if conf is not None:
+                cell_conf = conf[abs_ys, abs_xs]
+                order = np.argsort(cell_conf)[::-1][:per_cell]
+                abs_ys = abs_ys[order]
+                abs_xs = abs_xs[order]
+
+            selected_y.extend(abs_ys)
+            selected_x.extend(abs_xs)
+
+    return np.array(selected_y, dtype=np.int64), np.array(selected_x, dtype=np.int64)
+
+
+# =============================================================================
+# 3. 闭式加权最小二乘求解器 (Closed-form Warm Start)
+# =============================================================================
+def closed_form_horizontal_focal(
+    local_points: np.ndarray,
+    conf: np.ndarray | None = None,
+    conf_percent: float = 20.0,
+    min_ray: float = 0.01,
+) -> tuple[float, dict]:
+    """
+    解析解求解初始 fx (基于 Soft/Hard Mask 和 Confidence 权重)
+    """
+    P = np.asarray(local_points, dtype=np.float64)
+    H, W, _ = P.shape
+
+    yy, xx = np.meshgrid(np.arange(H, dtype=np.float64), np.arange(W, dtype=np.float64), indexing="ij")
+    cx, cy = (W - 1.0) * 0.5, (H - 1.0) * 0.5
+    aspect = H / W
+
+    X, Y, Z = P[..., 0], P[..., 1], P[..., 2]
+    rz = np.maximum(Z, 1e-8)
+    rx, ry = X / rz, Y / rz
+
+    # 分轴 or 条件
+    valid = np.isfinite(P).all(axis=-1) & (Z > 1e-6) & ((np.abs(rx) > min_ray) | (np.abs(ry) > min_ray))
+
+    # 1. 优先统一分配全局默认权重 w
+    w = np.ones((H, W), dtype=np.float64)
+
+    # 2. 如果存在 conf，更新 mask 并计算平滑权重
+    if conf is not None:
+        C = np.squeeze(np.asarray(conf, dtype=np.float64))
+        valid &= np.isfinite(C) & (C >= conf_percent / 100.0)
+        w = np.clip(C, 0.05, 1.0)
+
+    ys, xs = stratified_sampling_indices(valid, conf)
+    if len(xs) == 0:
+        raise RuntimeError("No valid local points found for closed-form solution.")
+
+    rx_s = rx[ys, xs]
+    ry_s = ry[ys, xs] * aspect
+    du_s = xx[ys, xs] - cx
+    dv_s = yy[ys, xs] - cy
+    w_s  = w[ys, xs]  # 👈 现在 w 保证绝对定义
+
+    denominator = np.sum(w_s * (rx_s ** 2 + ry_s ** 2))
+    if denominator <= 1e-12:
+        raise RuntimeError("Degenerate local point ray distribution.")
+
+    numerator = np.sum(w_s * (rx_s * du_s + ry_s * dv_s))
+    fx = numerator / denominator
+
+    if not np.isfinite(fx) or fx <= 0:
+        raise RuntimeError(f"Invalid estimated closed-form focal: {fx}")
+
+    fy = fx * aspect
+    u_proj = fx * rx[ys, xs] + cx
+    v_proj = fy * (ry_s / aspect) + cy
+    err = np.hypot(u_proj - xx[ys, xs], v_proj - yy[ys, xs])
+
+    stats = {
+        "fx_closed_form": float(fx),
+        "fy_closed_form": float(fy),
+        "fov_x_deg": float(2 * np.degrees(np.arctan(W / (2 * fx)))),
+        "fov_y_deg": float(2 * np.degrees(np.arctan(H / (2 * fy)))),
+        "median_error_px": float(np.median(err)),
+        "p90_error_px": float(np.percentile(err, 90)),
+        "valid_count": int(err.size),
+    }
+    return float(fx), stats
+
+
+# =============================================================================
+# 4. 鲁棒非线性迭代优化器 (Robust Soft-L1 Refinement)
+# =============================================================================
+def refine_horizontal_fov_from_local_points(
+    local_points: np.ndarray,
+    conf: np.ndarray | None = None,
+    fx0: float | None = None,
+    conf_percent: float = 20.0,
+    min_ray: float = 0.01,
+) -> tuple[float, float, dict]:
+    P = np.asarray(local_points, dtype=np.float64)
+    H, W, _ = P.shape
+
+    yy, xx = np.meshgrid(np.arange(H, dtype=np.float64), np.arange(W, dtype=np.float64), indexing="ij")
+    cx, cy = (W - 1.0) * 0.5, (H - 1.0) * 0.5
+    fy_ratio = H / W
+
+    X, Y, Z = P[..., 0], P[..., 1], P[..., 2]
+    rz = np.maximum(Z, 1e-8)
+    rx, ry = X / rz, Y / rz
+
+    valid = np.isfinite(P).all(axis=-1) & (Z > 1e-6) & ((np.abs(rx) > min_ray) | (np.abs(ry) > min_ray))
+
+    # 优先分配默认权重
+    weights = np.ones((H, W), dtype=np.float64)
+
+    if conf is not None:
+        C = np.squeeze(np.asarray(conf, dtype=np.float64))
+        valid &= np.isfinite(C) & (C >= max(float(conf_percent) / 100.0, 0.0))
+        weights = np.sqrt(np.clip(C, 0.05, 1.0))
+
+    ys, xs = stratified_sampling_indices(valid, conf)
+    if len(xs) == 0:
+        raise RuntimeError("No valid local points available for FOV refinement.")
+
+    rx_s = rx[ys, xs]
+    ry_s = ry[ys, xs]
+    u_s  = xx[ys, xs]
+    v_s  = yy[ys, xs]
+    w_s  = weights[ys, xs]
+
+    if fx0 is None:
+        fx0 = float(W)
+
+    def residual(log_fx):
+        fx = np.exp(log_fx[0])
+        fy = fx * fy_ratio
+        ru = fx * rx_s + cx - u_s
+        rv = fy * ry_s + cy - v_s
+        return np.concatenate([w_s * ru, w_s * rv])
+
+    result = least_squares(
+        residual,
+        x0=[np.log(float(fx0))],
+        loss="soft_l1",
+        f_scale=1.5,
+        max_nfev=100,
+    )
+
+    fx = float(np.exp(result.x[0]))
+    fy = fx * fy_ratio
+
+    ru_unweighted = fx * rx_s + cx - u_s
+    rv_unweighted = fy * ry_s + cy - v_s
+    errors = np.hypot(ru_unweighted, rv_unweighted)
+
+    fov_x = 2.0 * np.degrees(np.arctan(W / (2.0 * fx)))
+    fov_y = 2.0 * np.degrees(np.arctan(H / (2.0 * fy)))
+
+    stats = {
+        "fx": fx,
+        "fy": fy,
+        "fov_x_deg": float(fov_x),
+        "fov_y_deg": float(fov_y),
+        "median_error_px": float(np.median(errors)),
+        "p90_error_px": float(np.percentile(errors, 90)),
+        "valid_count": int(len(errors)),
+        "optimizer_cost": float(result.cost),
+    }
+
+    return fx, fy, stats
+
+
+# =============================================================================
+# 5. 逐相机估算与可辨识性诊断 Pipeline
+# =============================================================================
+def estimate_pi3_per_view_focals(
+    local_points: np.ndarray,
+    conf: np.ndarray,
+    conf_percent: float = 20.0,
+) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    n_views = local_points.shape[0]
+    focals = np.zeros((n_views, 2), dtype=np.float32)
+    principal_points = np.zeros((n_views, 2), dtype=np.float32)
+    diagnostics = []
+
+    for i in range(n_views):
+        verify_local_points_convention(local_points[i])
+        H, W = local_points[i].shape[:2]
+        
+        # 确保 conf_i 是 (H, W) 2D 数组
+        conf_i = np.squeeze(conf[i])
+
+        # Step 1: 闭式求解 Warm-start
+        fx_closed, closed_stats = closed_form_horizontal_focal(
+            local_points[i], conf=conf_i, conf_percent=conf_percent
+        )
+
+        # Step 2: 鲁棒非线性优化
+        fx, fy, stats = refine_horizontal_fov_from_local_points(
+            local_points[i], conf=conf_i, fx0=fx_closed, conf_percent=conf_percent
+        )
+
+        # Step 3: 可辨识性与稳定性诊断
+        delta_ratio = abs(fx - fx_closed) / fx_closed
+        stats["fx_closed_form"] = fx_closed
+        stats["refinement_delta_ratio"] = float(delta_ratio)
+        stats["status"] = "stable" if delta_ratio < 0.05 and stats["p90_error_px"] < 15.0 else "unstable"
+
+        if stats["status"] == "unstable":
+            print(f"⚠️ [Camera {i:02d} FOV Unstable] Closed-form: {fx_closed:.1f}px, Refined: {fx:.1f}px (Delta: {delta_ratio*100:.2f}%), p90_err: {stats['p90_error_px']:.2f}px")
+
+        focals[i] = [fx, fy]
+        principal_points[i] = [(W - 1.0) * 0.5, (H - 1.0) * 0.5]
+        diagnostics.append(stats)
+                      
+    focals = cluster_and_smooth_focals(focals, rel_tol=0.05, decimals=1)
+    return focals, principal_points, diagnostics
+
+def cluster_and_smooth_focals(
+    focals: np.ndarray, 
+    rel_tol: float = 0.05, 
+    decimals: int = 1
+) -> np.ndarray:
+    """
+    对逐相机焦距进行相对容差聚类与平滑截断
+    
+    参数:
+        focals: (N, 2) 逐相机 [fx, fy] 像素焦距
+        rel_tol: 相对容差 (默认 4%，约相当于 18.5mm 与 18.2mm 之间的判定门限)
+        decimals: 导出时保留的数值精度位数
+    """
+    n_views = len(focals)
+    if n_views <= 1:
+        return np.round(focals, decimals=decimals)
+
+    # 以 fx 作为聚类主轴
+    fx_vals = focals[:, 0]
+    fy_vals = focals[:, 1]
+    aspect_ratios = fy_vals / np.maximum(fx_vals, 1e-8)
+
+    clusters: list[list[int]] = []
+    
+    for idx, fx in enumerate(fx_vals):
+        assigned = False
+        for cluster in clusters:
+            cluster_fx_median = np.median(fx_vals[cluster])
+            if abs(fx - cluster_fx_median) / cluster_fx_median <= rel_tol:
+                cluster.append(idx)
+                assigned = True
+                break
+        if not assigned:
+            clusters.append([idx])
+
+    # 簇内取中位数平滑
+    smoothed_focals = focals.copy()
+    for cluster in clusters:
+        med_fx = np.median(fx_vals[cluster])
+        med_aspect = np.median(aspect_ratios[cluster])
+        med_fy = med_fx * med_aspect
+        
+        for c_idx in cluster:
+            smoothed_focals[c_idx] = [med_fx, med_fy]
+
+    return np.round(smoothed_focals, decimals=decimals)
 # =============================================================================
 # GeoCalib Calibration & FOV Processing
 # =============================================================================
@@ -581,6 +909,7 @@ def export_pointcloud_ply(predictions: dict, export_dir: Path, conf_thres: float
     write_binary_ply(output_path, vertices, raw_standard_colors)
     return output_path, len(vertices)
 
+
 def write_blender_camera_importer(pose_npz_path: Path, output_path: Path) -> None:
     script = f'''\
 import bpy, numpy as np
@@ -614,12 +943,27 @@ for i, pose_np in enumerate(poses_cv_c2w):
     cam.sensor_width = DEFAULT_SENSOR_WIDTH_MM
     cam.sensor_fit = 'HORIZONTAL'
 
+
+    # write_blender_camera_importer 生成的代码段:
     if has_intrinsics:
         fx, fy = focals[i]
         cx, cy = principal_points[i]
-        cam.lens = float(fx) * (cam.sensor_width / res_x)
-        cam.shift_x = (res_x / 2.0 - float(cx)) / res_x
-        cam.shift_y = (float(cy) - res_y / 2.0) / res_x
+        
+        # 基于相机水平宽度匹配焦距
+        # 对换算后的毫米数直接保留 1 位小数
+        raw_lens_mm = float(fx) * (cam.sensor_width / res_x)
+        cam.lens = round(raw_lens_mm, 1)
+        
+        # 仅当 cx, cy 偏离默认中心点超过 0.5 像素时才注入 shift
+        default_cx = (res_x - 1.0) * 0.5
+        default_cy = (res_y - 1.0) * 0.5
+        
+        if abs(cx - default_cx) > 0.5 or abs(cy - default_cy) > 0.5:
+            cam.shift_x = (res_x / 2.0 - float(cx)) / res_x
+            cam.shift_y = (float(cy) - res_y / 2.0) / res_x
+        else:
+            cam.shift_x = 0.0
+            cam.shift_y = 0.0
     else:
         cam.lens = {CONFIG.blender_placeholder_lens_mm}
 
@@ -725,14 +1069,18 @@ def run_pi3_inference(model: Pi3X, imgs: torch.Tensor) -> dict:
     predictions["conf"] = torch.sigmoid(predictions["conf"])
     pts_gpu = predictions["points"] if "points" in predictions else predictions["local_points"]
 
+
+    local_points = predictions["local_points"][0].detach().float().cpu().numpy()
     return {
         "images": imgs[None].permute(0, 1, 3, 4, 2)[0].detach().float().cpu().numpy(),
         "points": pts_gpu[0].detach().float().cpu().numpy(),
+        "local_points": local_points,  # 👈 必须补上
         "conf": predictions["conf"][0].detach().float().cpu().numpy(),
         "camera_poses": predictions["camera_poses"][0].detach().float().cpu().numpy(),
         "focals": None,
         "principal_points": None,
     }
+
 
 def run_model(session_id: str, model: Pi3X) -> dict:
     device = require_cuda()
@@ -740,24 +1088,39 @@ def run_model(session_id: str, model: Pi3X) -> dict:
 
     try:
         output = run_pi3_inference(model, imgs)
-        try:
-            focals, principal_points, g_worlds = estimate_geocalib(imgs, output["camera_poses"], device)
-            output["focals"] = focals
-            output["principal_points"] = principal_points
 
+        # 1. 优先调用 Pi3X local_points 回归算法
+        focals, principal_points, diagnostics = estimate_pi3_per_view_focals(
+            output["local_points"], output["conf"], conf_percent=CONFIG.default_confidence_percent
+        )
+        output["focals"] = focals
+        output["principal_points"] = principal_points
+        output["fov_diagnostics"] = diagnostics
+
+        # 2. GeoCalib 仅提取重力方向 g_worlds，不再覆盖 focals / principal_points
+        try:
+            _, _, g_worlds = estimate_geocalib(imgs, output["camera_poses"], device)
             if g_worlds:
-                output["points"], output["camera_poses"] = apply_gravity_alignment(output["points"], output["camera_poses"], g_worlds)
+                output["points"], output["camera_poses"] = apply_gravity_alignment(
+                    output["points"], output["camera_poses"], g_worlds
+                )
         except Exception as e:
-            print(f"⚠️ GeoCalib calibration failed: {e}")
+            print(f"⚠️ GeoCalib gravity alignment failed: {e}")
             traceback.print_exc()
 
         sess = SESSION_MANAGER.get_session(session_id)
         pred_path = sess["imgs_dir"].parent / "predictions_preview.npz"
 
-        save_dict = {k: output[k] for k in ("images", "points", "conf", "camera_poses")}
-        if output["focals"] is not None:
-            save_dict["focals"] = output["focals"]
-            save_dict["principal_points"] = output["principal_points"]
+        # 3. 补全 local_points 写入缓存
+        save_dict = {
+            "images": output["images"],
+            "points": output["points"],
+            "local_points": output["local_points"],  # 👈 必须写入缓存
+            "conf": output["conf"],
+            "camera_poses": output["camera_poses"],
+            "focals": output["focals"],
+            "principal_points": output["principal_points"],
+        }
 
         np.savez_compressed(pred_path, **save_dict)
         SESSION_MANAGER.set_predictions(session_id, output, pred_path)
