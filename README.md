@@ -15,13 +15,10 @@ Designed as a modular extension, this repository supercharges upstream Pi3—a *
 ---
 
 ## 🌟 Key Features
-
-* **Feed-forward SfM Engine**: Direct batch estimation of dense 3D point clouds, intrinsics, and camera poses from arbitrary, unconstrained image sequences.(implemented via pi3; I just provide the custom-built workbench)
-* **Robust Medoid Gravity Alignment**: Integrated with **[GeoCalib](https://github.com/cvg/GeoCalib)** using a 3-pass iterative center-refinement algorithm (`robust_g_mean`). Effectively suppresses extreme pitch outliers to align point clouds precisely with world vertical gravity (`[0, -1, 0]`).
-* **Self-Cleaning Session Manager**: LRU-based memory management prioritizing RAM for fast interactive previews while purging expired prediction caches and disk files to prevent storage bloat.
-* **Low-VRAM Offloading**: Smart CPU/GPU memory swapping between GeoCalib and Pi3 inference models prevents CUDA OOM on consumer GPUs.
-* **Blender Native Compatibility**: Automatically bakes a $+90^\circ$ X-axis coordinate flip into `.ply` point clouds and generates one-click Python scripts (`import_cameras_blender.py`) with real focal length remapping for Blender camera imports.
-
+* **Feed-Forward SfM Engine**: Direct batch reconstruction of dense 3D point clouds, local point maps, and camera poses from arbitrary image sequences via Pi3X, bypassing time-consuming traditional SfM solving.
+* **Robust Medoid Gravity Alignment**: Leverages **[GeoCalib](https://github.com/cvg/GeoCalib)** strictly for vertical gravity alignment. Uses a 3-pass iterative center-refinement algorithm (`robust_g_mean`) to suppress pitch outliers and align point clouds to world vertical (`[0, -1, 0]`).
+* **Blender Native Camera Export**: Generates one-click Python import scripts (`import_cameras_blender.py`) with full intrinsic/extrinsic alignment. Features regression-based FOV solving directly from local point maps, with automatic focal clustering and rounding (e.g., `18.3 mm`) to eliminate 2D-3D projection misalignments.
+* **Performance & Memory Optimization**: Built-in LRU Session Manager and smart CPU/GPU offloading between Pi3X and GeoCalib prevent CUDA OOM on consumer GPUs while automatically purging stale disk/RAM caches.
 ---
 
 ## 📁 Repository Structure
