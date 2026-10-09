@@ -15,32 +15,40 @@ Designed as a modular extension, this repository supercharges upstream Pi3—a *
 ---
 
 ## 🌟 Key Features
-* **Feed-Forward SfM Engine**: Direct batch reconstruction of dense 3D point clouds, local point maps, and camera poses from arbitrary image sequences via Pi3X, bypassing time-consuming traditional SfM solving.
-* **Robust Medoid Gravity Alignment**: Leverages **[GeoCalib](https://github.com/cvg/GeoCalib)** strictly for vertical gravity alignment. Uses a 3-pass iterative center-refinement algorithm (`robust_g_mean`) to suppress pitch outliers and align point clouds to world vertical (`[0, -1, 0]`).
-* **Blender Native Camera Export**: Generates one-click Python import scripts (`import_cameras_blender.py`) with full intrinsic/extrinsic alignment. Features regression-based FOV solving directly from local point maps, with automatic focal clustering and rounding (e.g., `18.3 mm`) to eliminate 2D-3D projection misalignments.
-* **Performance & Memory Optimization**: Built-in LRU Session Manager and smart CPU/GPU offloading between Pi3X and GeoCalib prevent CUDA OOM on consumer GPUs while automatically purging stale disk/RAM caches.
+- **Feed-Forward SfM Engine**: Direct batch reconstruction of dense 3D point clouds, local point maps, and camera poses from arbitrary image sequences via Pi3X, bypassing time-consuming traditional SfM solving.
+- **Robust Medoid Gravity Alignment**: Leverages **[GeoCalib](https://github.com/cvg/GeoCalib)** strictly for vertical gravity alignment. Uses a 3-pass iterative center-refinement algorithm (`robust_g_mean`) to suppress pitch outliers and align point clouds to world vertical (`[0, -1, 0]`).
+- **Blender Native Camera Export**: Generates one-click Python import scripts (`import_cameras_blender.py`) with full intrinsic/extrinsic alignment. Features regression-based FOV solving directly from local point maps, with automatic focal clustering and rounding (e.g., `18.3 mm`) to eliminate 2D-3D projection misalignments.
+- **Performance & Memory Optimization**: Built-in LRU Session Manager and smart CPU/GPU offloading between Pi3X and GeoCalib prevent CUDA OOM on consumer GPUs while automatically purging stale disk/RAM caches.
+
 ---
 
 ## 📁 Repository Structure
 
-Place all files directly into your local **Pi3 project root**:
+Place all modular workbench package files directly into your local **Pi3 project root**:
 
 ```text
 <Your_Pi3_Project_Root>/
 ├── venv/                        # Virtual environment (Default: "venv")
 ├── pi3/                         # Upstream Pi3 codebase
-├── weights/                     # Weights directory (auto-created by run_pi3_local.bat)
-│   ├── geocalib/                # Auto-downloaded GeoCalib weights
-│   ├── Pi3/                     # Base Pi3 weights
-│   └── Pi3X/                    # Base Pi3X weights (place model.safetensors here)
-├── _gradio_work/                # Auto-managed session cache (Auto-cleaned)
 ├── outputs/                     # Final exported PLY point clouds & camera pose files
-├── run_pi3_local.py             # [Mod] Custom Launcher & Workbench UI
-└── run_pi3_local.bat            # [Mod] Windows one-click runner
+├── pi3_workbench/               # [Mod] Modular Workbench Core Package
+│   ├── weights/                     # Weights directory (Auto-created by config.py)
+│   │   ├── geocalib/                # Auto-downloaded GeoCalib weights
+│   │   ├── Pi3/                     # Base Pi3 weights
+│   │   └── Pi3X/                    # Base Pi3X weights (place model.safetensors here)
+│   ├── _gradio_work/                # Auto-managed session cache (Auto-cleaned)
+│   ├── __init__.py
+│   ├── config.py
+│   ├── domain.py
+│   ├── export.py
+│   ├── core.py
+│   └── ui.py
+├── run_pi3_workbench.py         # [Mod] Main Launcher Entry Script
+└── run_pi3_workbench.bat        # [Mod] Windows one-click runner
 
 ```
 
-> ⚠️ **Note**: `run_pi3_local.bat` defaults to `.\venv`. Adjust the path if your environment name differs.
+> ⚠️ **Note**: `run_pi3_workbench.bat` defaults to `.\venv`. Adjust the path if your environment name differs.
 
 ---
 
@@ -105,9 +113,9 @@ with nn.attention.sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH, SDPB
 Run the launcher using the batch script or terminal:
 
 ```bat
-# Double-click run_pi3_local.bat OR run manually:
+# Double-click run_pi3_workbench.bat OR run manually:
 call venv\Scripts\activate
-python run_pi3_local.py
+python run_pi3_workbench.py
 
 ```
 
